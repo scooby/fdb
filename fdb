@@ -1,0 +1,507 @@
+#!/usr/bin/env python
+
+#    Copyright 2012 Benjamin Samuel
+
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import os.path as p
+import sys
+import threading as thr
+import Queue as thq
+import hashlib as h
+import sqlite3 as q
+import binascii as b
+import collections as c
+import plistlib as pl
+import subprocess as sp
+import datetime as dt
+import re
+from getopt import gnu_getopt
+from glob import iglob
+
+class fdb(object):
+    def __init__(s, dbfile):
+        s.dbfile = dbfile
+        s.dir = p.expanduser('~/fdb/')
+        if not p.exists(s.dir):
+            os.mkdir(s.dir, 0700)
+        dbf = p.join(s.dir, s.dbfile)
+        s.con = q.connect(dbf)
+        with s.con:
+            s.con.executescript("""PRAGMA synchronous = OFF;
+                PRAGMA journal_mode = TRUNCATE;
+                PRAGMA foreign_constraints = ON;""")
+    def setup(s):
+        with s.con:
+            s.con.executescript("""
+CREATE TABLE IF NOT EXISTS Devices (
+   did INT PRIMARY KEY,
+   uuid TEXT NOT NULL UNIQUE,
+   node TEXT,
+   volumename TEXT);
+
+CREATE TABLE IF NOT EXISTS Groups (
+   gid INT PRIMARY KEY,
+   uuid TEXT NOT NULL UNIQUE,
+   name TEXT,
+   realname TEXT);
+
+CREATE TABLE IF NOT EXISTS Users (
+   uid INT PRIMARY KEY,
+   uuid TEXT NOT NULL UNIQUE,
+   name TEXT,
+   realname TEXT);
+
+CREATE TABLE IF NOT EXISTS Inodes (
+   dev INT NOT NULL REFERENCES Devices(did) ON UPDATE CASCADE ON DELETE CASCADE,
+   inode INT NOT NULL,
+   mode INT NOT NULL,
+   uid INT NOT NULL REFERENCES Users(uid) ON UPDATE CASCADE ON DELETE CASCADE,
+   gid INT NOT NULL REFERENCES Groups(gid) ON UPDATE CASCADE ON DELETE CASCADE,
+   mtime DATETIME NOT NULL,
+   size INT NOT NULL,
+   hash TEXT,
+   PRIMARY KEY (dev, inode));
+
+CREATE TABLE IF NOT EXISTS Paths (
+   path TEXT NOT NULL, dev TEXT NOT NULL, inode INT NOT NULL,
+   PRIMARY KEY (path), FOREIGN KEY (dev, inode) REFERENCES Inodes (dev, inode));
+
+CREATE INDEX IF NOT EXISTS inode_Paths ON Paths (dev, inode);
+
+CREATE VIEW IF NOT EXISTS PathNodes AS
+   SELECT path, p.dev AS dev, p.inode AS inode,
+          mode, uid, gid, mtime, size, hash
+   FROM Paths p JOIN Inodes i USING (dev, inode);
+
+CREATE TRIGGER IF NOT EXISTS PathNodes_del INSTEAD OF
+    DELETE ON PathNodes FOR EACH ROW BEGIN
+        DELETE FROM Inodes WHERE dev = old.dev AND inode = old.inode;
+        DELETE FROM Paths WHERE dev = old.dev AND inode = old.inode;
+    END;
+
+CREATE TRIGGER IF NOT EXISTS PathNodes_ins INSTEAD OF
+    INSERT ON PathNodes FOR EACH ROW BEGIN
+        INSERT OR REPLACE INTO Inodes (dev, inode, mode, uid, gid,
+            mtime, size, hash) VALUES (new.dev, new.inode, new.mode,
+            new.uid, new.gid, new.mtime, new.size, new.hash);
+        INSERT OR REPLACE INTO Paths (path, dev, inode)
+            VALUES (new.path, new.dev, new.inode);
+    END;
+
+CREATE TRIGGER IF NOT EXISTS PathNodes_upd INSTEAD OF
+    UPDATE ON PathNodes FOR EACH ROW BEGIN
+        UPDATE OR REPLACE Inodes SET dev=new.dev, inode=new.inode,
+            mode=new.mode, uid=new.uid, gid=new.gid, mtime=new.mtime,
+            size=new.size, hash=new.hash
+            WHERE dev=old.dev AND inode=old.inode;
+        UPDATE OR REPLACE Paths SET dev=new.dev, inode=new.inode,
+            path=new.path
+            WHERE dev=old.dev AND inode=old.inode;
+    END;
+""" % {'mtimetype': 'REAL' if os.stat_float_times() else 'INT'})
+    def attach(s, otherdbfile):
+        s.con.execute("ATTACH DATABASE ? AS other", (otherdbfile,))
+    def walk_fs(s, top):
+        dm = s.devices
+        um = s.users
+        gm = s.groups
+        queue = c.deque([p.abspath(top)])
+        while queue:
+            path = queue.popleft()
+            if p.islink(path):
+                continue
+            elif p.isdir(path):
+                try:
+                    listing = [p.join(path, ent) for ent in os.listdir(path)]
+                    listing.sort(key=lambda ent: p.join(ent, '') if p.isdir(ent) else ent)
+                    listing.reverse()
+                    queue.extendleft(listing)
+                except IOError:
+                    pass
+            elif p.isfile(path):
+                rs = os.stat(path)
+                yield (unicode(path, 'utf8'), rs.st_mode, rs.st_ino, dm[rs.st_dev],
+                       um[rs.st_uid], gm[rs.st_gid],
+                       rs.st_size, rs.st_mtime)
+            else:
+                continue
+    def walk_db(s, top):
+        with s.con:
+            return s.con.execute(
+                """SELECT path, mode, inode, dev, uid, gid, size, mtime
+                FROM Paths JOIN Inodes USING (dev, inode)
+                WHERE path GLOB ? ORDER BY path""",
+                (antiglob(p.join(p.abspath(top), '')) + '*',))
+    def paths_fs(s, top):
+        for tup in s.walk_fs(top):
+            print tup[0].encode('utf8')
+    def paths_db(s, top):
+        for tup in s.walk_db(top):
+            print tup[0].encode('utf8')
+    def newscan(s, top):
+        def coerce(tup):
+            return tuple(int(v) for v in tup)
+        for (path, curdata, newdata) in iterUnion(s.walk_db(top), s.walk_fs(top)):
+            curdata = coerce(curdata)
+            newdata = coerce(newdata)
+            with s.con:
+                if not newdata:
+                    s.con.execute("DELETE FROM Paths WHERE path=?", (path,))
+                elif curdata != newdata:
+                    #print "Replacing %r with %r..." % (curdata, newdata)
+                    (mode, ino, dev, uid, gid, size, mtime) = newdata
+                    s.con.execute("""
+                        REPLACE INTO Inodes
+                        (inode, dev, mode, uid, gid, mtime, size, hash)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+                                  (ino, dev, mode, uid, gid, mtime, size))
+                    s.con.execute("REPLACE INTO Paths (path, inode, dev)"
+                                  + " VALUES (?, ?, ?)", (path, ino, dev))
+                else:
+                    pass
+        with s.con:
+            s.con.executescript("ANALYZE Paths; ANALYZE Inodes;")
+    def import_hashes(s):
+        with s.con:
+            s.con.execute("""
+                UPDATE Inodes SET hash =
+               (SELECT hash FROM other.Inodes oi
+                WHERE Inodes.inode = oi.inode AND Inodes.dev = oi.dev
+                AND Inodes.size = oi.size AND Inodes.mode = oi.mode
+                AND Inodes.uid = oi.uid AND Inodes.gid = oi.gid
+                AND Inodes.mtime = oi.mtime
+                AND NOT EXISTS (SELECT  path FROM Paths p
+                    WHERE Inodes.inode = p.inode AND Inodes.dev = p.dev
+                    EXCEPT SELECT path FROM other.Paths op
+                    WHERE Inodes.inode = op.inode AND Inodes.dev = op.dev)
+                AND NOT EXISTS (SELECT  path FROM other.Paths op
+                    WHERE Inodes.inode = op.inode AND Inodes.dev = op.dev
+                    EXCEPT SELECT path FROM Paths p
+                    WHERE Inodes.inode = p.inode AND Inodes.dev = p.dev))""")
+            s.con.executescript("ANALYZE Paths; ANALYZE Inodes;")
+    def clear_hashes(s):
+        with s.con:
+            s.con.execute("UPDATE Inodes SET hash = NULL")
+    def clear_primary(s):
+        with s.con:
+            s.con.executescript("DELETE FROM Paths; DELETE FROM Inodes; VACUUM;")
+    def clean_orphan_inodes(s):
+        with s.con:
+            s.con.execute("""
+                DELETE FROM Inodes WHERE NOT EXISTS (SELECT * FROM Paths p
+                WHERE Inodes.dev=p.dev AND Inodes.inode=p.inode)""")
+            s.con.execute("ANALYZE Inodes;")
+    def report_null_hashes(s):
+        with s.con:
+            cur = s.con.cursor()
+            cur.execute(""" SELECT COUNT(*) AS NULL_HASHES
+                FROM Inodes i WHERE i.hash IS NULL""")
+            for tup in cur:
+                print "Database reports %d hashes to update" % (tup[0],)
+                return
+    def calculate_hashes(s, release=True):
+        qr = thq.Queue()
+        def hasher(lst, lstlock, devlock):
+            bs = 1048576
+            while True:
+                with lstlock:
+                    if not lst:
+                        break
+                    tup = lst.pop()
+                (dev, inode, path) = tup
+                hf = h.sha384()
+                with open(path, 'rb', 0) as fo:
+                    with devlock:
+                        buf = fo.read(bs)
+                    while buf:
+                        hf.update(buf)
+                        with devlock:
+                            buf = fo.read(bs)
+                qr.put( (unicode(b.hexlify(hf.digest())), inode, dev) )
+
+        devs = dict()
+        print "Set up work queues..."
+        with s.con:
+            cur = s.con.cursor()
+            cur.execute("""SELECT did from Devices""")
+            for dev, in cur:
+                devs[dev] = []
+        for dev in devs.iterkeys():
+            print "For device %d..." % dev
+            cur = s.con.execute("""SELECT inode, path FROM PathNodes WHERE hash IS NULL AND dev = ?""", (dev,))
+            m = dict()
+            while True:
+                a = cur.fetchmany(1024)
+                if not a:
+                    break
+                m.update(a)
+            devs[dev] = [(dev, inode, path) for inode, path in m.iteritems()]
+        print "Setting up threads..."
+        count = 0
+        qws = []
+        for dev, lst in devs.items():
+            count += len(lst)
+            devlock = thr.Lock()
+            lstlock = thr.Lock()
+            for x in (1, 2):
+                t = thr.Thread(target=hasher, args=(lst, lstlock, devlock))
+                t.daemon = True
+                t.start()
+
+        for x in xrange(0, count):
+            tup = qr.get()
+            print "%d of %d" % (x+1, count)
+            with s.con:
+                s.con.execute(
+                    "UPDATE Inodes SET hash=? WHERE inode=? AND dev=?",
+                    tup)
+
+    def report_duplicates(s):
+        cur = s.con.execute("""
+            SELECT path, inode, hash, size
+            FROM (SELECT hash FROM Inodes
+                JOIN Paths p USING (dev, inode)
+                GROUP BY hash HAVING COUNT(hash) > 1
+                ORDER BY path) JOIN Inodes USING (hash)
+                JOIN Paths USING (dev, inode)""")
+        (ohsh, onode, osiz) = (None, None, None)
+        for path, inode, hsh, size in cur:
+            if ohsh is not None and hsh != ohsh and size != osiz:
+                print
+            print (u" |  " if onode == inode else u" +--") + path
+            (ohsh, onode, osiz) = (hsh, inode, size)
+    def link_duplicates(s):
+        with s.con:
+            cur = s.con.cursor()
+            cur2 = s.con.cursor()
+            cur.execute("""
+                SELECT path, i.dev, i.inode, i.hash, i.size
+                FROM Inodes i JOIN Paths USING (dev, inode)
+                WHERE hash IN (SELECT hash FROM Inodes
+                    GROUP BY hash HAVING COUNT(hash) > 1)
+                ORDER BY dev, hash, size""")
+            (lpath, odev, lnode, ohsh, osiz) = (None, None, None, None, None)
+            for path, dev, inode, hsh, siz in cur:
+                assert path != lpath
+                if dev == odev and hsh == ohsh and siz == osiz:
+                    if inode != lnode:
+                        os.unlink(path)
+                        os.link(lpath, path)
+                        print "   Linked to %s" % (path,)
+                        cur2.execute("UPDATE Paths SET inode=? WHERE path=?",
+                                    (lnode, path))
+                else:
+                    if dev != odev:
+                        print "Device changed from %s to %s" % (odev, dev)
+                    odev = dev
+                    if hsh != ohsh:
+                        print "Hash changed from %s to %s" % (ohsh, hsh)
+                    if siz != osiz:
+                        print "Size changed from %s to %s" % (osiz, siz)
+                    print "Node path is %s" % (path,)
+                    ohsh = hsh
+                    osiz = siz
+                    lnode = inode
+                    lpath = path
+    def vacuum(s):
+        with s.con:
+            s.con.execute("VACUUM")
+    def environment(s):
+        def dscl(*args):
+            dat = sp.Popen(['/usr/bin/dscl', '-plist', '.'] + list(args), stdout=sp.PIPE).communicate()[0]
+            #print "dscl %r: %s\n" % (args, dat)
+            return pl.readPlistFromString(dat)
+        def dsuf(p, k):
+            try:
+                return p['dsAttrTypeStandard:'+k][0]
+            except KeyError:
+                return None
+            except IndexError:
+                return None
+        def diskutil(op, *args):
+            return pl.readPlistFromString(sp.Popen(
+                    ['/usr/sbin/diskutil', op, '-plist'] + list(args),
+                    stdout=sp.PIPE).communicate()[0])
+        def dulu(d, k):
+            try:
+                return d[k]
+            except KeyError:
+                return None
+
+        def merge(table, fs_iter, cols):
+            uniq_map = dict()
+            loc_map = dict()
+            remap = dict()
+            with s.con:
+                sql = "SELECT %s FROM %s" % (', '.join(cols), table)
+                #print sql
+                for tup in s.con.execute(sql):
+                    uniq_map[tup[1]] = tup
+                    loc_map[tup[0]] = tup
+            try:
+                loc_max = max(loc_map.iterkeys())
+            except ValueError:
+                loc_max = 0
+            for tup in fs_iter:
+                loc_max = max(loc_max, tup[0])
+                if tup[0] in loc_map and tup[1] in uniq_map and uniq_map[tup[1]][0] != tup[0]:
+                    dbid = loc_max + 1
+                    loc_max+=1
+                else:
+                    dbid = tup[0]
+                remap[tup[0]] = dbid
+                if tup[1] in uniq_map:
+                    if any(a != b for a, b in zip((dbid,) + tup[1:], uniq_map[tup[1]])):
+                        with s.con:
+                            sql = "UPDATE %s SET %s WHERE %s = ?" % (
+                                table, ', '.join(c + ' = ?' for c in cols[0:1]
+                                                 + cols[2:]), cols[1])
+                            #print sql
+                            args = (dbid,) + tup[2:] + tup[1:2]
+                            #print repr(args)
+                            s.con.execute(sql, args)
+                        loc_map[tup[0]] = (dbid,) + tup[1:]
+                else:
+                    with s.con:
+                        sql = "INSERT INTO %s (%s) VALUES (%s)" % (
+                            table, ', '.join(cols), ', '.join('?' for e in tup))
+                        #print sql
+                        args = (dbid,) + tup[1:]
+                        #print repr(args)
+                        s.con.execute(sql, args)
+                    uniq_map[tup[1]] = tup
+                    loc_map[tup[0]] = (dbid,) + tup[1:]
+            #print repr(loc_map)
+            return remap
+
+        def iterUsersFS():
+            for user in dscl('-readall', '/Users'):
+                uid = int(dsuf(user, 'UniqueID')) # Value used in filesystem
+                uuid = dsuf(user, 'GeneratedUID') # Universally unique identifier
+                realname = dsuf(user, 'RealName') # Person's real name
+                name = dsuf(user, 'RecordName') # Short name used in filesystem
+                assert uuid is not None
+                yield uid, uuid, realname, name
+        def iterGroupsFS():
+            for group in dscl('-readall', '/Groups'):
+                gid = int(dsuf(group, 'PrimaryGroupID')) # Value used in filesystem
+                uuid = dsuf(group, 'GeneratedUID') # Universally unique identifier
+                realname = dsuf(group, 'RealName') # Group's descriptive name
+                name = dsuf(group, 'RecordName') # Short name used in filesystem
+                assert uuid is not None
+                yield gid, uuid, realname, name
+        def iterDevicesFS():
+            for p in iglob('/dev/disk*'):
+                i = os.stat(p).st_rdev
+                if i != 0:
+                    did = i
+                    dui = diskutil("info", p)
+                    node = dulu(dui, "DeviceNode")
+                    vol_name = dulu(dui, "VolumeName")
+                    uuid = dulu(dui, "VolumeUUID")
+                    if uuid is not None:
+                        yield did, uuid, vol_name, node
+        s.users = merge('users', iterUsersFS(), ('uid', 'uuid', 'realname', 'name'))
+        s.groups = merge('groups', iterGroupsFS(), ('gid', 'uuid', 'realname', 'name'))
+        s.devices = merge('devices', iterDevicesFS(), ('did', 'uuid', 'volumename', 'node'))
+
+def iterUnion(iter1, iter2):
+    class omega(object):
+        def __ge__(self, other):
+            if isinstance(other, omega):
+                raise StopIteration
+            return True
+        def __le__(self, other):
+            if isinstance(other, omega):
+                raise StopIteration
+            return False
+        def __repr__(self):
+            return "omega"
+    def _next(i):
+        try:
+            n = next(i)
+        except StopIteration:
+            return (omega(), ())
+        return (n[0], n[1:])
+    (h1, t1) = _next(iter1)
+    (h2, t2) = _next(iter2)
+    while True:
+        yield (h1 if h1 <= h2 else h2,
+               t1 if h1 <= h2 else (),
+               t2 if h2 <= h1 else ())
+        if h1 <= h2:
+            (h1, t1) = _next(iter1)
+        if h2 <= h1:
+            (h2, t2) = _next(iter2)
+
+antiglob_re = re.compile(r'[\[\]\*\?]')
+def antiglob(path):
+    """ Handles glob characters []*?^ """
+    return antiglob_re.sub(r"[\1]", path)
+
+if __name__ == '__main__':
+    db = None
+    for k, v in gnu_getopt(sys.argv[1:], 'd:Da:s:iecHhrlxXw:W:v')[0]:
+        if k == '-d':
+            print "Opening database: " + v
+            db = fdb(v)
+        elif k == '-D':
+            print "Initializing database: " + v
+            db.setup()
+        elif k == '-e':
+            print "Reading environment"
+            db.environment()
+        elif k == '-a':
+            print "Attaching database: " + v
+            db.attach(v)
+        elif k == '-s':
+            print "Scanning in tree: " + v
+            db.newscan(v)
+        elif k == '-i':
+            print "Importing hashes from attached..."
+            db.import_hashes()
+        elif k == '-c':
+            print "Clearing hashes..."
+            db.clear_hashes()
+        elif k == '-h':
+            print "Calculating new hashes..."
+            db.calculate_hashes(False)
+        elif k == '-H':
+            print "Counting unhashed inodes..."
+            db.report_null_hashes()
+        elif k == '-r':
+            print "Reporting duplicate files..."
+            db.report_duplicates()
+        elif k == '-l':
+            print "Hard linking duplicate files..."
+            db.link_duplicates()
+        elif k == '-x':
+            print "Clearing database..."
+            db.clear_primary()
+        elif k == '-X':
+            print "Cleaning orphan inodes..."
+            db.clean_orphan_inodes()
+        elif k == '-w':
+            print "Walking filesystem..."
+            db.paths_fs(v)
+        elif k == '-W':
+            print "Walking database..."
+            db.paths_db(v)
+        elif k == '-v':
+            print "Vacuuming database..."
+            db.vacuum()
+        else:
+            print "Unrecognized option: %r" % (k, v)
